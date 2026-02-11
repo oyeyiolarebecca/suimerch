@@ -1,3 +1,4 @@
+#[allow(lint(public_entry))]
 module merch_store::store;
 
 use std::string::{Self, String};
@@ -11,10 +12,23 @@ use sui::sui::SUI;
 const ENotAdmin: u64 = 1;
 const EInsufficientStock: u64 = 2;
 const EInsufficientPayment: u64 = 3;
-const EProductNotFound: u64 = 4;
+const EInvalidDeliveryInfo: u64 = 5;
+const EInvalidEmailFormat: u64 = 6;
 
 /// One-Time Witness for the module
 public struct STORE has drop {}
+
+/// Delivery information for orders
+public struct DeliveryInfo has store, copy, drop {
+    recipient_name: String,
+    address_line_1: String,
+    address_line_2: String,
+    city: String,
+    postal_code: String,
+    country: String,
+    email: String,
+    phone: String,
+}
 
 /// The main store object, owned by the admin
 public struct Store has key {
@@ -41,6 +55,8 @@ public struct Receipt has key, store {
     price_paid: u64,
     buyer: address,
     walrus_blob_id: String, // Reference to product metadata
+    delivery_info: Option<DeliveryInfo>,
+    checkout_timestamp: u64,
 }
 
 // ====== Events ======
@@ -62,6 +78,15 @@ public struct ProductPurchased has copy, drop {
     buyer: address,
     price: u64,
     receipt_id: ID,
+}
+
+public struct CheckoutCompleted has copy, drop {
+    product_id: u64,
+    buyer: address,
+    receipt_id: ID,
+    delivery_city: String,
+    delivery_country: String,
+    timestamp: u64,
 }
 
 // ====== Admin Functions ======
@@ -161,6 +186,17 @@ public entry fun update_stock(
 
 // ====== User Functions ======
 
+/// Validate delivery information
+fun validate_delivery_info(delivery: &DeliveryInfo) {
+    assert!(string::length(&delivery.recipient_name) > 0, EInvalidDeliveryInfo);
+    assert!(string::length(&delivery.address_line_1) > 0, EInvalidDeliveryInfo);
+    assert!(string::length(&delivery.city) > 0, EInvalidDeliveryInfo);
+    assert!(string::length(&delivery.postal_code) > 0, EInvalidDeliveryInfo);
+    assert!(string::length(&delivery.country) > 0, EInvalidDeliveryInfo);
+    assert!(string::length(&delivery.email) > 0, EInvalidEmailFormat);
+    assert!(string::length(&delivery.phone) > 0, EInvalidDeliveryInfo);
+}
+
 /// Purchase a product with SUI
 /// Decreases stock and mints a Receipt NFT to the buyer
 public entry fun purchase(product: &mut Product, payment: Coin<SUI>, ctx: &mut TxContext) {
@@ -182,6 +218,8 @@ public entry fun purchase(product: &mut Product, payment: Coin<SUI>, ctx: &mut T
         price_paid: product.price,
         buyer: ctx.sender(),
         walrus_blob_id: product.walrus_blob_id,
+        delivery_info: option::none(),
+        checkout_timestamp: 0,
     };
 
     let receipt_id = object::id(&receipt);
@@ -195,6 +233,75 @@ public entry fun purchase(product: &mut Product, payment: Coin<SUI>, ctx: &mut T
 
     // Transfer payment to store admin (product object doesn't hold balance)
     // In production, you'd transfer to the store's treasury
+    transfer::public_transfer(payment, @merch_store);
+
+    // Transfer Receipt NFT to buyer
+    transfer::public_transfer(receipt, ctx.sender());
+}
+
+/// Checkout with delivery information - Purchase product and add delivery details
+/// This is a convenient all-in-one function for purchasing with delivery info
+public entry fun checkout(
+    product: &mut Product,
+    payment: Coin<SUI>,
+    recipient_name: vector<u8>,
+    address_line_1: vector<u8>,
+    address_line_2: vector<u8>,
+    city: vector<u8>,
+    postal_code: vector<u8>,
+    country: vector<u8>,
+    email: vector<u8>,
+    phone: vector<u8>,
+    ctx: &mut TxContext,
+) {
+    // Verify stock availability
+    assert!(product.stock > 0, EInsufficientStock);
+
+    // Verify payment amount
+    let payment_amount = coin::value(&payment);
+    assert!(payment_amount >= product.price, EInsufficientPayment);
+
+    // Create and validate delivery info
+    let delivery = DeliveryInfo {
+        recipient_name: string::utf8(recipient_name),
+        address_line_1: string::utf8(address_line_1),
+        address_line_2: string::utf8(address_line_2),
+        city: string::utf8(city),
+        postal_code: string::utf8(postal_code),
+        country: string::utf8(country),
+        email: string::utf8(email),
+        phone: string::utf8(phone),
+    };
+
+    validate_delivery_info(&delivery);
+
+    // Decrease stock
+    product.stock = product.stock - 1;
+
+    // Create Receipt NFT with delivery info
+    let receipt = Receipt {
+        id: object::new(ctx),
+        product_name: product.name,
+        product_id: product.product_id,
+        price_paid: product.price,
+        buyer: ctx.sender(),
+        walrus_blob_id: product.walrus_blob_id,
+        delivery_info: option::some(delivery),
+        checkout_timestamp: ctx.epoch(),
+    };
+
+    let receipt_id = object::id(&receipt);
+
+    event::emit(CheckoutCompleted {
+        product_id: product.product_id,
+        buyer: ctx.sender(),
+        receipt_id,
+        delivery_city: delivery.city,
+        delivery_country: delivery.country,
+        timestamp: ctx.epoch(),
+    });
+
+    // Transfer payment to store admin
     transfer::public_transfer(payment, @merch_store);
 
     // Transfer Receipt NFT to buyer
@@ -218,3 +325,15 @@ public fun get_receipt_info(receipt: &Receipt): (String, u64, u64, address, Stri
         receipt.walrus_blob_id,
     )
 }
+
+/// Get delivery info from receipt
+public fun get_delivery_info(receipt: &Receipt): Option<DeliveryInfo> {
+    receipt.delivery_info
+}
+
+/// Get checkout timestamp
+public fun get_checkout_timestamp(receipt: &Receipt): u64 {
+    receipt.checkout_timestamp
+}
+
+
